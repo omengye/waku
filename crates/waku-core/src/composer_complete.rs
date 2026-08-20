@@ -306,7 +306,7 @@ pub fn discover_slash_commands(provider: ProviderKind, project_root: &Path) -> V
             }
         }
         // Harness commands are session-scoped and reported live by the Host.
-        ProviderKind::DeepSeek | ProviderKind::Grok => {}
+        ProviderKind::DeepSeek | ProviderKind::Grok | ProviderKind::DeerFlow => {}
     }
     // The cross-tool skill standard, read by Amp and OpenCode among others;
     // Waku lists it for every provider.

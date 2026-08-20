@@ -368,7 +368,10 @@ fn perform_message_rewind(
             && request.retained_turn_count == 0
             && matches!(
                 request.provider,
-                ProviderKind::Claude | ProviderKind::Cursor | ProviderKind::Grok
+                ProviderKind::Claude
+                    | ProviderKind::Cursor
+                    | ProviderKind::Grok
+                    | ProviderKind::DeerFlow
             ),
         cleanup_error,
     })
@@ -388,7 +391,10 @@ fn perform_provider_rewind(
         && request.retained_turn_count == 0
         && matches!(
             provider,
-            ProviderKind::Claude | ProviderKind::Cursor | ProviderKind::Grok
+            ProviderKind::Claude
+                | ProviderKind::Cursor
+                | ProviderKind::Grok
+                | ProviderKind::DeerFlow
         );
     if request.rollback_turns == 0 || reset_native_session {
         return Ok((None, None, None));
@@ -479,23 +485,33 @@ fn perform_provider_rewind(
                 .cursor;
             Ok((Some(cursor), None, None))
         }
-        ProviderKind::Cursor => {
+        ProviderKind::Cursor | ProviderKind::DeerFlow => {
             let source = request.cursor_source.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(tr!(
                     "errors.provider_waku_task_unavailable",
-                    provider = "Cursor"
+                    provider = provider.display_name()
                 ))
             })?;
+            let fork_request = match provider {
+                ProviderKind::Cursor => {
+                    waku_client::provider_session::ProviderSessionForkRequest::Cursor {
+                        source: source.clone(),
+                        turn_count: request.retained_turn_count,
+                    }
+                }
+                ProviderKind::DeerFlow => {
+                    waku_client::provider_session::ProviderSessionForkRequest::DeerFlow {
+                        source: source.clone(),
+                        turn_count: request.retained_turn_count,
+                    }
+                }
+                _ => unreachable!(),
+            };
             Ok((
                 Some(
                     request
                         .workspace_client
-                        .fork_provider_session(
-                            waku_client::provider_session::ProviderSessionForkRequest::Cursor {
-                                source: source.clone(),
-                                turn_count: request.retained_turn_count,
-                            },
-                        )?
+                        .fork_provider_session(fork_request)?
                         .cursor,
                 ),
                 None,
@@ -695,15 +711,24 @@ fn perform_response_fork(mut request: ResponseForkRequest) -> Result<PreparedRes
                 let (cursor, prepared_driver) = fork_response_with_driver(&mut request)?;
                 Ok((cursor, None, prepared_driver))
             }
-            ProviderKind::Cursor => Ok((
+            ProviderKind::Cursor | ProviderKind::DeerFlow => Ok((
                 request
                     .workspace_client
-                    .fork_provider_session(
-                        waku_client::provider_session::ProviderSessionForkRequest::Cursor {
-                            source: request.source.clone(),
-                            turn_count: request.turn_count,
-                        },
-                    )?
+                    .fork_provider_session(match request.source.provider {
+                        ProviderKind::Cursor => {
+                            waku_client::provider_session::ProviderSessionForkRequest::Cursor {
+                                source: request.source.clone(),
+                                turn_count: request.turn_count,
+                            }
+                        }
+                        ProviderKind::DeerFlow => {
+                            waku_client::provider_session::ProviderSessionForkRequest::DeerFlow {
+                                source: request.source.clone(),
+                                turn_count: request.turn_count,
+                            }
+                        }
+                        _ => unreachable!(),
+                    })?
                     .cursor,
                 None,
                 None,
@@ -2205,7 +2230,8 @@ impl Waku {
         let provider = source.provider;
         let provider_cursor = source.provider_cursor.clone();
         let session_title = source.display_title().to_owned();
-        let cursor_source = (provider == ProviderKind::Cursor).then(|| source.clone());
+        let cursor_source =
+            matches!(provider, ProviderKind::Cursor | ProviderKind::DeerFlow).then(|| source.clone());
         let edited_message_id = edit.message_id;
         let Some(edited_message_index) = source
             .turns
@@ -2409,6 +2435,7 @@ impl Waku {
                     | ProviderKind::DeepSeek
                     | ProviderKind::OpenCode
                     | ProviderKind::Grok
+                    | ProviderKind::DeerFlow
             ) && provider_rewind_cursor.is_some())
         {
             // Headless drivers retain their original native session ID. Recreate

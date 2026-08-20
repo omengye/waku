@@ -19,10 +19,11 @@ pub enum ProviderKind {
     OpenCode,
     Grok,
     Pi,
+    DeerFlow,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Amp,
         Self::Claude,
         Self::Codex,
@@ -31,6 +32,7 @@ impl ProviderKind {
         Self::OpenCode,
         Self::Grok,
         Self::Pi,
+        Self::DeerFlow,
     ];
 
     pub fn id(self) -> &'static str {
@@ -43,6 +45,7 @@ impl ProviderKind {
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
             Self::Pi => "pi",
+            Self::DeerFlow => "deerflow",
         }
     }
 
@@ -56,6 +59,7 @@ impl ProviderKind {
             Self::OpenCode => "OpenCode",
             Self::Grok => "Grok Build",
             Self::Pi => "Pi",
+            Self::DeerFlow => "DeerFlow",
         }
     }
 
@@ -69,6 +73,7 @@ impl ProviderKind {
             Self::OpenCode => "OpenCode",
             Self::Grok => "Grok",
             Self::Pi => "Pi",
+            Self::DeerFlow => "DeerFlow",
         }
     }
 
@@ -84,6 +89,7 @@ impl ProviderKind {
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
             Self::Pi => "pi",
+            Self::DeerFlow => "deerflow-acp",
         }
     }
 
@@ -98,6 +104,7 @@ impl ProviderKind {
                 | Self::OpenCode
                 | Self::Grok
                 | Self::Pi
+                | Self::DeerFlow
         )
     }
 
@@ -112,6 +119,7 @@ impl ProviderKind {
                 | Self::OpenCode
                 | Self::Grok
                 | Self::Pi
+                | Self::DeerFlow
         )
     }
 
@@ -162,6 +170,9 @@ pub enum ProviderResumeCursor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_file: Option<PathBuf>,
     },
+    DeerFlow {
+        session_id: String,
+    },
 }
 
 impl ProviderResumeCursor {
@@ -187,6 +198,7 @@ impl ProviderResumeCursor {
                 session_id: id,
                 session_file: None,
             },
+            ProviderKind::DeerFlow => Self::DeerFlow { session_id: id },
         }
     }
 
@@ -200,6 +212,7 @@ impl ProviderResumeCursor {
             Self::OpenCode { .. } => ProviderKind::OpenCode,
             Self::Grok { .. } => ProviderKind::Grok,
             Self::Pi { .. } => ProviderKind::Pi,
+            Self::DeerFlow { .. } => ProviderKind::DeerFlow,
         }
     }
 
@@ -211,7 +224,8 @@ impl ProviderResumeCursor {
             | Self::DeepSeek { session_id }
             | Self::OpenCode { session_id }
             | Self::Grok { session_id }
-            | Self::Pi { session_id, .. } => session_id,
+            | Self::Pi { session_id, .. }
+            | Self::DeerFlow { session_id } => session_id,
             Self::Codex { thread_id } => thread_id,
         }
     }
@@ -3769,6 +3783,7 @@ mod tests {
         assert_eq!(ProviderKind::OpenCode.command(), "opencode");
         assert_eq!(ProviderKind::Grok.command(), "grok");
         assert_eq!(ProviderKind::Pi.command(), "pi");
+        assert_eq!(ProviderKind::DeerFlow.command(), "deerflow-acp");
     }
 
     #[test]
@@ -3782,6 +3797,7 @@ mod tests {
             ProviderKind::OpenCode,
             ProviderKind::Grok,
             ProviderKind::Pi,
+            ProviderKind::DeerFlow,
         ] {
             assert!(provider.supports_conversation_fork());
             assert!(provider.supports_conversation_rollback());
@@ -3798,6 +3814,7 @@ mod tests {
         assert!(ProviderKind::OpenCode.supports_model_discovery());
         assert!(ProviderKind::Grok.supports_model_discovery());
         assert!(ProviderKind::Pi.supports_model_discovery());
+        assert!(!ProviderKind::DeerFlow.supports_model_discovery());
     }
 
     #[test]

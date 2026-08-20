@@ -57,6 +57,10 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         }
         ProviderKind::DeepSeek | ProviderKind::OpenCode | ProviderKind::Pi => Vec::new(),
         ProviderKind::Grok => vec![ProviderModel::new("grok-build", "Grok Build").default()],
+        ProviderKind::DeerFlow => vec![
+            ProviderModel::new("deepseek-v4-flash", "DeepSeek V4 Flash").default(),
+            ProviderModel::new("gemini-3.6-flash-high", "Gemini 3.6 Flash (High)"),
+        ],
     }
 }
 

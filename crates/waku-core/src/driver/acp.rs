@@ -80,6 +80,10 @@ fn launch_for(provider: ProviderKind) -> anyhow::Result<AcpLaunch> {
             args: vec!["acp".into()],
             env: Vec::new(),
         }),
+        ProviderKind::DeerFlow => Ok(AcpLaunch {
+            args: Vec::new(),
+            env: Vec::new(),
+        }),
         _ => Err(anyhow!(
             "{} does not speak the Agent Client Protocol",
             provider.display_name()
@@ -190,7 +194,7 @@ impl AcpDriver {
 
 fn sdk_agent(
     binary: &Path,
-    cwd: &Path,
+    _cwd: &Path,
     mut launch: AcpLaunch,
     computer_use: Option<&super::support::HeadlessComputerUseConfig>,
     stderr_lines: Arc<Mutex<Vec<String>>>,
@@ -198,7 +202,8 @@ fn sdk_agent(
     let binary = binary
         .to_str()
         .ok_or_else(|| anyhow!("the ACP executable path is not valid UTF-8"))?;
-    let cwd = cwd
+    #[cfg(unix)]
+    let cwd = _cwd
         .to_str()
         .ok_or_else(|| anyhow!("the ACP working directory is not valid UTF-8"))?;
     let (computer_args, computer_env) =
@@ -217,11 +222,18 @@ fn sdk_agent(
     environment.extend(computer_env);
 
     // `AcpAgentConfig` deliberately contains only argv and environment. macOS
-    // `env -C` supplies the session cwd without a shell, preserving exact
+    // and Linux `env -C` supplies the session cwd without a shell, preserving exact
     // argument boundaries and the SDK's process-group lifecycle management.
-    let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary.to_owned()];
-    args.extend(launch.args);
-    let config = AcpAgentConfig::new("/usr/bin/env")
+    #[cfg(unix)]
+    let (program, args) = {
+        let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary.to_owned()];
+        args.extend(launch.args);
+        ("/usr/bin/env".to_owned(), args)
+    };
+    #[cfg(windows)]
+    let (program, args) = (binary.to_owned(), launch.args);
+
+    let config = AcpAgentConfig::new(program)
         .args(args)
         .envs(environment);
     Ok(AcpAgent::new(config).with_debug(move |line, direction| {
@@ -480,6 +492,7 @@ async fn run_sdk_connection(
             apply_model(
                 &connection,
                 &session_id,
+                provider,
                 current_model.as_deref(),
                 reasoning_effort.as_deref(),
                 &events,
@@ -588,6 +601,7 @@ async fn run_sdk_connection(
                             apply_model(
                                 &connection,
                                 &session_id,
+                                provider,
                                 current_model.as_deref(),
                                 options.reasoning_effort.as_deref(),
                                 &events,
@@ -667,6 +681,7 @@ fn desired_mode(
 async fn apply_model(
     connection: &ConnectionTo<Agent>,
     session_id: &SessionId,
+    provider: ProviderKind,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     events: &DriverEventSender,
@@ -674,33 +689,52 @@ async fn apply_model(
     let Some(model) = model else {
         return;
     };
-    let request = match UntypedMessage::new(
-        "session/set_model",
-        json!({"sessionId": session_id, "modelId": model}),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
+    if provider == ProviderKind::Cursor {
+        let request = match UntypedMessage::new(
+            "session/set_model",
+            json!({"sessionId": session_id, "modelId": model}),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.select_model",
+                    error = error
+                )));
+                return;
+            }
+        };
+        if let Err(error) = connection.send_request(request).block_task().await {
             let _ = events.send(DriverEvent::Error(tr!(
                 "errors.select_model",
                 error = error
             )));
             return;
         }
-    };
-    if let Err(error) = connection.send_request(request).block_task().await {
-        let _ = events.send(DriverEvent::Error(tr!(
-            "errors.select_model",
-            error = error
-        )));
-        return;
-    }
-    if let Some(effort) = reasoning_effort {
-        // Reasoning effort is an optional config extension and is deliberately
-        // non-fatal when an agent does not expose it.
+    } else {
+        // Standard ACP agents (such as DeerFlow) expose model selection through
+        // `session/set_config_option` with `configId: "model"`.
         let _ = connection
             .send_request(SetSessionConfigOptionRequest::new(
                 session_id.clone(),
-                "mode",
+                "model",
+                model,
+            ))
+            .block_task()
+            .await;
+    }
+
+    if let Some(effort) = reasoning_effort {
+        // Reasoning effort is an optional config extension and is deliberately
+        // non-fatal when an agent does not expose it.
+        let option_id = if provider == ProviderKind::DeerFlow {
+            "thinking_enabled"
+        } else {
+            "mode"
+        };
+        let _ = connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                option_id,
                 effort,
             ))
             .block_task()

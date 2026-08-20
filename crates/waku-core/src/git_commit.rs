@@ -341,6 +341,9 @@ fn agent_arguments(
                 push(&mut args, effort);
             }
         }
+        ProviderKind::DeerFlow => {
+            push(&mut args, "--print");
+        }
     }
     push(&mut args, prompt);
     args
@@ -744,6 +747,9 @@ mod tests {
                     assert!(has(&args, "--no-session"));
                     assert!(has(&args, "--no-tools"));
                     assert!(has_pair(&args, "--thinking", "low"));
+                }
+                ProviderKind::DeerFlow => {
+                    assert!(has(&args, "--print"));
                 }
             }
         }

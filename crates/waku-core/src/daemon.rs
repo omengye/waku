@@ -988,10 +988,17 @@ impl WakuBackend {
                 self.fork_response_with_driver(source, cwd, turns_to_remove)?,
                 HashMap::new(),
             )),
-            ProviderKind::Cursor => {
-                let fork = fork_provider_session(ProviderSessionForkRequest::Cursor {
-                    source: source.clone(),
-                    turn_count,
+            ProviderKind::Cursor | ProviderKind::DeerFlow => {
+                let fork = fork_provider_session(match source.provider {
+                    ProviderKind::Cursor => ProviderSessionForkRequest::Cursor {
+                        source: source.clone(),
+                        turn_count,
+                    },
+                    ProviderKind::DeerFlow => ProviderSessionForkRequest::DeerFlow {
+                        source: source.clone(),
+                        turn_count,
+                    },
+                    _ => unreachable!(),
                 })?;
                 Ok((fork.cursor, HashMap::new()))
             }
@@ -1128,7 +1135,10 @@ impl WakuBackend {
         let reset_native_session = retained_turn_count == 0
             && matches!(
                 source.provider,
-                ProviderKind::Claude | ProviderKind::Cursor | ProviderKind::Grok
+                ProviderKind::Claude
+                    | ProviderKind::Cursor
+                    | ProviderKind::Grok
+                    | ProviderKind::DeerFlow
             );
         if reset_native_session {
             return Ok((None, HashMap::new(), true));
@@ -1193,12 +1203,19 @@ impl WakuBackend {
                 .cursor;
                 Ok((Some(cursor), HashMap::new(), false))
             }
-            ProviderKind::Cursor => {
-                let cursor = fork_provider_session(ProviderSessionForkRequest::Cursor {
-                    source: source.clone(),
-                    turn_count: retained_turn_count,
-                })?
-                .cursor;
+            ProviderKind::Cursor | ProviderKind::DeerFlow => {
+                let request = match source.provider {
+                    ProviderKind::Cursor => ProviderSessionForkRequest::Cursor {
+                        source: source.clone(),
+                        turn_count: retained_turn_count,
+                    },
+                    ProviderKind::DeerFlow => ProviderSessionForkRequest::DeerFlow {
+                        source: source.clone(),
+                        turn_count: retained_turn_count,
+                    },
+                    _ => unreachable!(),
+                };
+                let cursor = fork_provider_session(request)?.cursor;
                 Ok((Some(cursor), HashMap::new(), false))
             }
             ProviderKind::Grok => {
@@ -1436,6 +1453,13 @@ fn fork_provider_session(
             turn_count,
         } => (
             crate::grok_session::fork_session_at_turn(&binary, &cwd, &session_id, turn_count)?,
+            HashMap::new(),
+            None,
+        ),
+        ProviderSessionForkRequest::DeerFlow { source: _, turn_count: _ } => (
+            ProviderResumeCursor::DeerFlow {
+                session_id: String::new(),
+            },
             HashMap::new(),
             None,
         ),

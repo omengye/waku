@@ -79,6 +79,10 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         // Pi's catalog depends on the user's configured LLM providers. A
         // fabricated fallback would make unavailable models look selectable.
         ProviderKind::Pi => Vec::new(),
+        ProviderKind::DeerFlow => vec![
+            ProviderModel::new("deepseek-v4-flash", "DeepSeek V4 Flash").default(),
+            ProviderModel::new("gemini-3.6-flash-high", "Gemini 3.6 Flash (High)"),
+        ],
     }
 }
 
@@ -120,6 +124,7 @@ pub fn discover_catalog(
         ProviderKind::OpenCode => (discover_opencode_models(binary), None),
         ProviderKind::Grok => (discover_grok_models(binary), None),
         ProviderKind::Pi => (discover_pi_models(binary), None),
+        ProviderKind::DeerFlow => (Vec::new(), None),
     };
     let models = if discovered.is_empty() {
         // A failed or empty probe keeps the last successful discovery over

@@ -39,6 +39,10 @@ pub enum ProviderSessionForkRequest {
         session_id: String,
         turn_count: usize,
     },
+    DeerFlow {
+        source: AgentSession,
+        turn_count: usize,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
