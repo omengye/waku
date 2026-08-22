@@ -978,12 +978,6 @@ async fn apply_model(
     let Some(model) = model else {
         return;
     };
-    if provider == ProviderKind::Cursor {
-        let request = match UntypedMessage::new(
-            "session/set_model",
-            json!({"sessionId": session_id, "modelId": model}),
-        ) {
-            Ok(request) => request,
     let cursor_model_option = (provider == ProviderKind::Cursor)
         .then_some(config_options)
         .flatten()
@@ -1021,10 +1015,6 @@ async fn apply_model(
                     "errors.select_model",
                     error = error
                 )));
-                return;
-            }
-        };
-        if let Err(error) = connection.send_request(request).block_task().await {
             }
         }
         return;
@@ -1084,22 +1074,7 @@ async fn apply_model(
         return;
     }
 
-    // Grok, Kimi, OpenCode, and Cursor agents that do not advertise a model
-    // config option retain the legacy request unchanged. Fx intentionally
-    // stays on session/set_config_option, its documented model API.
-    let request = match UntypedMessage::new(
-        "session/set_model",
-        json!({"sessionId": session_id, "modelId": model}),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            let _ = events.send(DriverEvent::Error(tr!(
-                "errors.select_model",
-                error = error
-            )));
-            return;
-        }
-    } else {
+    if provider == ProviderKind::DeerFlow {
         // Standard ACP agents (such as DeerFlow) expose model selection through
         // `session/set_config_option` with `configId: "model"`.
         let _ = connection
@@ -1110,6 +1085,30 @@ async fn apply_model(
             ))
             .block_task()
             .await;
+    } else {
+        // Grok, Kimi, OpenCode, and Cursor agents that do not advertise a model
+        // config option retain the legacy request unchanged. Fx intentionally
+        // stays on session/set_config_option, its documented model API.
+        let request = match UntypedMessage::new(
+            "session/set_model",
+            json!({"sessionId": session_id, "modelId": model}),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.select_model",
+                    error = error
+                )));
+                return;
+            }
+        };
+        if let Err(error) = connection.send_request(request).block_task().await {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.select_model",
+                error = error
+            )));
+            return;
+        }
     }
 
     if let Some(effort) = reasoning_effort {
