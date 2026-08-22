@@ -171,6 +171,7 @@ const ICONS: &[(&str, &[u8])] = icons![
     "provider-cursor",
     "provider-deerflow",
     "provider-deepseek",
+    "provider-fx",
     "provider-grok",
     "provider-kimi",
     "provider-openai",

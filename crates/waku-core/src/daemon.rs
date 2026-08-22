@@ -1052,8 +1052,11 @@ impl WakuBackend {
             }
             // Unreachable through the UI, which hides branching for providers
             // that answer `supports_conversation_fork` with false.
-            ProviderKind::Kimi => {
-                bail!("Kimi Code cannot branch a conversation at a turn")
+            ProviderKind::Fx | ProviderKind::Kimi => {
+                bail!(
+                    "{} cannot branch a conversation at a turn",
+                    source.provider.display_name()
+                )
             }
         }
     }
@@ -1262,8 +1265,11 @@ impl WakuBackend {
             )),
             // Unreachable through the UI, which hides rewinding for providers
             // that answer `supports_conversation_rollback` with false.
-            ProviderKind::Kimi => {
-                bail!("Kimi Code cannot rewind a conversation to a turn")
+            ProviderKind::Fx | ProviderKind::Kimi => {
+                bail!(
+                    "{} cannot rewind a conversation to a turn",
+                    source.provider.display_name()
+                )
             }
         }
     }

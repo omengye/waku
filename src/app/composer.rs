@@ -1804,13 +1804,21 @@ impl Waku {
             .selected_session()
             .map(|session| session.interaction_mode)
             .unwrap_or_default();
-        let supports_plan = self.selected_session().is_none_or(|session| {
-            session.provider != ProviderKind::DeepSeek
-                || self.agent_preset_for_session(session).as_deref() != Some("minimal")
+        let selected_session = self.selected_session();
+        let supports_plan = selected_session.is_none_or(|session| {
+            session.provider != ProviderKind::Fx
+                && (session.provider != ProviderKind::DeepSeek
+                    || self.agent_preset_for_session(session).as_deref() != Some("minimal"))
         });
-        // A stale state can still be switched back to Build; Minimal simply
-        // cannot be toggled from Build into a plan capability it does not mount.
+        // A stale state can still be switched back to Build; providers without
+        // a plan capability cannot be toggled from Build into one.
         let interactive = mode == InteractionMode::Plan || supports_plan;
+        let plan_unavailable_message = selected_session
+            .filter(|session| session.provider == ProviderKind::Fx)
+            .map_or_else(
+                || tr!("agent_preset.minimal_no_plan"),
+                |_| tr!("mode.plan_not_supported"),
+            );
         let next_mode = if mode == InteractionMode::Plan {
             InteractionMode::Build
         } else {
@@ -1859,7 +1867,7 @@ impl Waku {
             .when(!interactive, |element| {
                 element
                     .opacity(0.7)
-                    .tooltip(Tooltip::text(tr!("agent_preset.minimal_no_plan")))
+                    .tooltip(Tooltip::text(plan_unavailable_message))
             })
             .into_any_element()
     }
@@ -2076,8 +2084,8 @@ impl Waku {
     }
 
     /// The text and attachment presentation accepted from the composer. The
-    /// exact provider prompt keeps its `@` mentions, while sent-message UI uses
-    /// `display_content` and the retained attachment metadata.
+    /// stored prompt keeps its `@` mentions and visible command syntax, while
+    /// sent-message UI uses `display_content` and retained attachment metadata.
     pub(super) fn submission_with_attachments(
         &mut self,
         prompt: &str,
@@ -2360,12 +2368,7 @@ impl Waku {
             return None;
         }
         let theme = Theme::current(cx);
-        let steerable = session.is_busy()
-            && session.status != SessionStatus::Connecting
-            && self
-                .runtimes
-                .get(&session.id)
-                .is_some_and(|runtime| runtime.driver.supports_steer());
+        let steerable = self.session_can_steer(session);
         let mut list = div().flex().flex_col().py(px(4.0));
         for message in &session.queued_messages {
             let message_id = message.id;
