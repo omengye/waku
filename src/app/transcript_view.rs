@@ -166,7 +166,7 @@ impl Waku {
     }
 
     pub(super) fn render_transcript(
-        &self,
+        &mut self,
         window: &mut Window,
         chat_viewport_width: f32,
         cx: &mut Context<Self>,
@@ -174,6 +174,8 @@ impl Waku {
         self.prefetch_checkpoint_refs(cx);
         self.sync_transcript_rows();
         self.sync_transcript_layout_width(window);
+        self.apply_pending_transcript_search_reveal(window, cx);
+        let search_bar = self.render_transcript_search_bar(chat_viewport_width, cx);
         let transcript_rows = self.active_transcript_rows().clone();
         // A scrollbar drag owns the position for as long as it lasts, and the
         // bar writes offsets straight into the list rather than through its
@@ -330,11 +332,20 @@ impl Waku {
                     .size_full(),
             )
         });
+        let transcript_focus = self.transcript_focus.clone();
         div()
             .flex_1()
             .min_h_0()
             .w_full()
             .relative()
+            .key_context("Transcript")
+            .track_focus(&transcript_focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.transcript_focus, cx);
+                }),
+            )
             // Painted before any row, so the frame's selection registry holds
             // exactly the text elements this frame put on screen, in order.
             .child(md::render::frame_reset(self.transcript_selection.clone()))
@@ -357,6 +368,7 @@ impl Waku {
                 &self.transcript_scrollbar,
             ))
             .child(self.transcript_selection_input())
+            .children(search_bar)
             .into_any_element()
     }
 
@@ -1283,12 +1295,15 @@ impl Waku {
                         MarkdownMetrics::BODY
                     });
                     let animate_streaming = message.streaming && !cx.reduce_motion();
-                    let ctx = self.markdown_ctx(
+                    let mut ctx = self.markdown_ctx(
                         format!("message-{}", message.id),
                         &palette,
                         metrics,
                         animate_streaming,
                     );
+                    if let Some(highlights) = self.transcript_search_highlights(message_index) {
+                        ctx = ctx.with_search_highlights(highlights);
+                    }
                     // Human and assistant messages share the Markdown path.
                     // Parse only visible rows rather than doing work for every
                     // driver delta or every off-screen prompt.
@@ -1437,7 +1452,7 @@ impl Waku {
             .items_center()
             .gap(px(5.0))
             .cursor_default()
-            .text_size(sp(11.5))
+            .text_size(sp(12.5))
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme.text_secondary)
             .focus_visible(|style| style.border_color(theme.accent))
@@ -1511,7 +1526,7 @@ impl Waku {
                                     .flex()
                                     .items_center()
                                     .gap(px(6.0))
-                                    .text_size(sp(11.0))
+                                    .text_size(sp(12.5))
                                     .line_height(sp(14.0))
                                     .child(
                                         div()
@@ -1552,7 +1567,7 @@ impl Waku {
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_size(sp(11.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.text_secondary)
                             .tooltip(Tooltip::text(file.path.clone()))
                             .child(file.path.clone()),
@@ -1560,14 +1575,14 @@ impl Waku {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(sp(10.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.success)
                             .child(format!("+{}", file.additions)),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(sp(10.5))
+                            .text_size(sp(12.5))
                             .text_color(theme.danger)
                             .child(format!("-{}", file.deletions)),
                     ),
@@ -1601,7 +1616,7 @@ impl Waku {
                     .items_center()
                     .gap(px(6.0))
                     .cursor_default()
-                    .text_size(sp(11.5))
+                    .text_size(sp(12.5))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_secondary)
                     .focus_visible(|style| style.bg(theme.overlay_strong))
@@ -1677,8 +1692,8 @@ impl Waku {
                     .items_center()
                     .gap(px(5.0))
                     .cursor_default()
-                    .text_size(sp(11.5))
-                    .line_height(sp(16.0))
+                    .text_size(sp(13.5))
+                    .line_height(sp(18.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_tertiary)
                     .child(SharedString::from(label))
@@ -1688,7 +1703,7 @@ impl Waku {
                         } else {
                             "icons/chevron-right.svg"
                         },
-                        10.0,
+                        11.5,
                         theme.text_tertiary,
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1718,8 +1733,8 @@ impl Waku {
             .child(working_wave_dots(theme.text_tertiary))
             .child(
                 div()
-                    .text_size(sp(11.5))
-                    .line_height(sp(16.0))
+                    .text_size(sp(13.5))
+                    .line_height(sp(18.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_tertiary)
                     .child(SharedString::from(tr!(
@@ -1899,7 +1914,7 @@ impl Waku {
                     .flex()
                     .items_center()
                     .cursor_default()
-                    .text_size(sp(9.5))
+                    .text_size(sp(12.5))
                     .text_color(color)
                     .focus_visible(|style| style.border_color(theme.accent))
                     .hover(|style| style.bg(theme.overlay_strong))
@@ -1985,7 +2000,7 @@ impl Waku {
                         .when(!item_expanded, |element| {
                             element.rounded_bl(px(8.0)).rounded_br(px(8.0))
                         })
-                        .text_size(sp(12.0))
+                        .text_size(sp(12.5))
                         .line_height(sp(16.0))
                         .when(has_detail, |element| {
                             element
@@ -2552,7 +2567,7 @@ fn activity_diff_break_row(label: Option<String>, theme: &Theme) -> AnyElement {
         .font_family(md::render::MONO_FAMILY)
         // Fixed like the Review panel's gap and hunk captions: a caption in
         // the code surface follows neither font setting.
-        .text_size(px(10.5))
+        .text_size(px(12.5))
         .bg(theme.overlay)
         .text_color(theme.text_ghost)
         .child(

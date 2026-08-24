@@ -54,7 +54,7 @@ use crate::ui::tooltip::Tooltip;
 use crate::browser::BrowserView;
 use crate::persistence::{
     ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
-    PersistedState, PersistedWindowState, StateStore,
+    PersistedState, PersistedWindowState, SidebarGrouping, SidebarOrdering, StateStore,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
@@ -66,11 +66,12 @@ use crate::ui::{
     icon_button, motion, provider_color, provider_icon, status_color, toggle_switch,
 };
 use crate::{
-    CancelTurn, CloseFind, CloseWindow, CopySelection, FindNext, FindPrevious, FocusComposer,
-    NavigateBack, NavigateForward, NewProject, NewSession, OpenFind, OpenFindReplace, OpenSettings,
-    ReplaceAllMatches, SaveFile, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
-    ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
-    ToggleUsagePanel,
+    CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch, CopySelection,
+    FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward, NewProject, NewSession,
+    OpenFind, OpenFindReplace, OpenSettings, ReplaceAllMatches, SaveFile, SelectFirstTask,
+    SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette,
+    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
+    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -787,7 +788,7 @@ fn traits_choice(theme: Theme, label: String, is_default: bool, selected: bool) 
             .when(is_default, |element| {
                 element.child(
                     div()
-                        .h(px(16.0))
+                        .h(px(18.0))
                         .px(px(5.0))
                         .flex_none()
                         .rounded(px(4.0))
@@ -796,7 +797,7 @@ fn traits_choice(theme: Theme, label: String, is_default: bool, selected: bool) 
                         .bg(theme.overlay)
                         .flex()
                         .items_center()
-                        .text_size(sp(9.0))
+                        .text_size(sp(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.text_tertiary)
                         .child(tr!("common.default")),
@@ -936,8 +937,8 @@ struct ComputerUsePreview {
 struct SessionNavigation {
     back: Vec<Uuid>,
     forward: Vec<Uuid>,
-    /// The unstarted task behind the global New Task entry. Viewing another
-    /// session must not make that entry forget the project chosen for it.
+    /// The most recently selected unstarted task. The global New Task entry
+    /// may reuse it only when it belongs to the currently selected project.
     new_task: Option<Uuid>,
 }
 
@@ -981,11 +982,17 @@ impl SessionNavigation {
         self.new_task = Some(session_id);
     }
 
-    fn remembered_new_task(&self, sessions: &[AgentSession]) -> Option<Uuid> {
+    fn remembered_new_task(
+        &self,
+        sessions: &[AgentSession],
+        current_project_id: Uuid,
+    ) -> Option<Uuid> {
         self.new_task.filter(|session_id| {
-            sessions
-                .iter()
-                .any(|session| session.id == *session_id && !session.has_started())
+            sessions.iter().any(|session| {
+                session.id == *session_id
+                    && session.project_id == current_project_id
+                    && !session.has_started()
+            })
         })
     }
 }
@@ -1052,6 +1059,7 @@ pub struct Waku {
     composer_draft_store: ComposerDraftStore,
     composer_draft_save_generation: u64,
     command_palette: command_palette::CommandPaletteUi,
+    task_switcher: task_switcher::TaskSwitcherUi,
     model_search: Entity<TextInput>,
     settings_search: Entity<TextInput>,
     daemon_port_input: Entity<TextInput>,
@@ -1289,9 +1297,18 @@ pub struct Waku {
     /// One stable field reused across sidebar rows so virtualization never
     /// replaces the focused editor while a rename is in progress.
     session_rename_input: Entity<TextInput>,
-    /// Date groups the user has folded in the sidebar. This is intentionally
-    /// runtime-only, like transcript disclosure state.
-    sidebar_collapsed_groups: HashSet<SessionDateGroup>,
+    /// Groups the user has folded in either sidebar view. This is
+    /// intentionally runtime-only, like transcript disclosure state.
+    sidebar_collapsed_groups: HashSet<SidebarGroup>,
+    /// Number of older sessions revealed inside each project section. This is
+    /// runtime-only so every launch starts with the recent three-day view.
+    sidebar_project_reveal_counts: HashMap<SidebarGroup, usize>,
+    /// Stable keyboard focus for each virtualized sidebar group header and
+    /// its hover-revealed New Task control.
+    sidebar_group_header_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
+    sidebar_group_compose_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
+    /// Stable keyboard focus for each virtualized project-history reveal row.
+    sidebar_show_more_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
     sidebar_visible: bool,
     sidebar_width: f32,
     right_panel_visible: bool,
@@ -1435,6 +1452,11 @@ pub struct Waku {
     /// Fingerprint + snapshot pair backing `sidebar_rows_cached`.
     sidebar_rows_fingerprint: Cell<Option<u64>>,
     sidebar_rows_snapshot: RefCell<Rc<Vec<SidebarRow>>>,
+    /// Branch labels for ordinary local project paths, resolved together on a
+    /// background executor so sidebar rows only read memory.
+    sidebar_branch_labels: RefCell<HashMap<PathBuf, SharedString>>,
+    sidebar_branch_scan_fingerprint: Cell<Option<u64>>,
+    sidebar_branch_scan_generation: Cell<u64>,
     transcript_row_kinds: RefCell<Vec<TranscriptRowKind>>,
     /// Fingerprint of the transcript inputs `transcript_row_kinds` was folded
     /// from, so an unchanged transcript costs nothing on a frame. `None` until
@@ -1521,6 +1543,13 @@ pub struct Waku {
     markdown_link_handler: md::render::LinkHandler,
     /// Transcript-wide text selection, spanning messages and tool output.
     transcript_selection: TranscriptSelection,
+    /// Programmatic focus for the transcript canvas. Clicking the transcript
+    /// moves focus here so the shared find action can distinguish it from the
+    /// right-panel file editor without putting the canvas in the tab order.
+    transcript_focus: FocusHandle,
+    /// Find-in-page state for the selected transcript, created lazily on the
+    /// first primary-modifier F press.
+    transcript_search: Option<transcript_search::TranscriptSearch>,
     /// Independent selection for the transient toast message. Keeping it out
     /// of the transcript registry prevents an overlay from joining a drag to
     /// whatever happens to be painted beneath it.
@@ -1565,7 +1594,9 @@ mod settings;
 mod sidebar;
 mod skills_page;
 mod streaming;
+mod task_switcher;
 mod transcript;
+mod transcript_search;
 mod transcript_view;
 mod usage_meter;
 mod usage_page;
@@ -1581,7 +1612,7 @@ use components::*;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
-use sidebar::{SessionDateGroup, SidebarRow};
+use sidebar::{SidebarGroup, SidebarRow};
 pub use skills_page::init as init_skills_keys;
 use streaming::*;
 use transcript::*;
@@ -2222,6 +2253,19 @@ impl Waku {
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
             let model_picker_empty_focus = cx.focus_handle();
+            let task_switcher_focus = cx.focus_handle();
+            cx.on_focus_out(
+                &task_switcher_focus,
+                window,
+                |this: &mut Self, _, window, cx| {
+                    this.cancel_task_switcher(window, cx);
+                },
+            )
+            .detach();
+            let mut task_switcher = task_switcher::TaskSwitcherUi::new(task_switcher_focus);
+            if let Some(selected_session) = state.selected_session {
+                task_switcher.record_access(selected_session);
+            }
 
             cx.on_focus(&updater_button_focus, window, |this: &mut Self, _, cx| {
                 this.set_updater_button_focused(true, cx);
@@ -2645,6 +2689,7 @@ impl Waku {
                 composer_draft_store,
                 composer_draft_save_generation: 0,
                 command_palette: command_palette::CommandPaletteUi::new(command_palette_search),
+                task_switcher,
                 model_search,
                 branch_search,
                 branch_create_input,
@@ -2767,6 +2812,10 @@ impl Waku {
                 session_rename: None,
                 session_rename_input,
                 sidebar_collapsed_groups: HashSet::new(),
+                sidebar_project_reveal_counts: HashMap::new(),
+                sidebar_group_header_focuses: RefCell::new(HashMap::new()),
+                sidebar_group_compose_focuses: RefCell::new(HashMap::new()),
+                sidebar_show_more_focuses: RefCell::new(HashMap::new()),
                 sidebar_visible,
                 sidebar_width,
                 right_panel_visible,
@@ -2866,6 +2915,9 @@ impl Waku {
                 sidebar_row_cache: RefCell::new(Vec::new()),
                 sidebar_rows_fingerprint: Cell::new(None),
                 sidebar_rows_snapshot: RefCell::new(Rc::new(Vec::new())),
+                sidebar_branch_labels: RefCell::new(HashMap::new()),
+                sidebar_branch_scan_fingerprint: Cell::new(None),
+                sidebar_branch_scan_generation: Cell::new(0),
                 transcript_row_kinds: RefCell::new(Vec::new()),
                 transcript_row_kinds_fingerprint: Cell::new(None),
                 transcript_navigation_turns: RefCell::new(Rc::new(Vec::new())),
@@ -2894,6 +2946,8 @@ impl Waku {
                 activity_diff_viewports: RefCell::new(HashMap::new()),
                 markdown_link_handler,
                 transcript_selection: TranscriptSelection::default(),
+                transcript_focus: cx.focus_handle(),
+                transcript_search: None,
                 toast_selection: TranscriptSelection::default(),
                 transcript_scrollbar: ScrollbarState::new(),
                 menus: RefCell::new(HashMap::new()),

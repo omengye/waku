@@ -96,26 +96,14 @@ fn percent_decode_file_path(path: &str) -> String {
 
 fn markdown_file_link_path(target: &str) -> Option<PathBuf> {
     let target = strip_file_location(target.trim());
-    let path = if target.starts_with('/') {
-        target
-    } else if let Some(path) = target.strip_prefix("file://") {
-        if path.starts_with('/') {
-            path
-        } else if let Some(path) = path.strip_prefix("localhost")
-            && path.starts_with('/')
-        {
-            path
-        } else {
-            return None;
-        }
-    } else if let Some(path) = target.strip_prefix("file:")
-        && path.starts_with('/')
+    if target
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
     {
-        path
-    } else {
-        return None;
-    };
-    let path = PathBuf::from(percent_decode_file_path(path));
+        return url::Url::parse(target).ok()?.to_file_path().ok();
+    }
+
+    let path = PathBuf::from(percent_decode_file_path(target));
     path.is_absolute().then_some(path)
 }
 
@@ -1089,35 +1077,37 @@ mod tests {
 
     #[test]
     fn transcript_file_links_route_by_the_active_workspace() {
-        let workspace = Path::new("/Users/egoist/dev/waku");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let project_file = workspace.join("src/app/right_panel.rs");
+        let project_file_with_line = format!("{}:1596", project_file.display());
+        let project_file_with_column = format!("{}:1596:8", project_file.display());
+        let relative_project_file = Path::new("src")
+            .join("app")
+            .join("right_panel.rs")
+            .to_string_lossy()
+            .into_owned();
 
         assert_eq!(
-            transcript_link_route(
-                "/Users/egoist/dev/waku/src/app/right_panel.rs:1596",
-                Some(workspace),
-            ),
-            TranscriptLinkRoute::ProjectFile("src/app/right_panel.rs".into())
+            transcript_link_route(&project_file_with_line, Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(relative_project_file.clone())
         );
         assert_eq!(
-            transcript_link_route(
-                "/Users/egoist/dev/waku/src/app/right_panel.rs:1596:8",
-                Some(workspace),
-            ),
-            TranscriptLinkRoute::ProjectFile("src/app/right_panel.rs".into())
+            transcript_link_route(&project_file_with_column, Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(relative_project_file)
         );
+
+        let encoded_file_url =
+            url::Url::from_file_path(workspace.join("My File.rs")).expect("absolute file path");
         assert_eq!(
-            transcript_link_route(
-                "file:///Users/egoist/dev/waku/My%20File.rs#L12C4",
-                Some(workspace),
-            ),
+            transcript_link_route(&format!("{encoded_file_url}#L12C4"), Some(workspace)),
             TranscriptLinkRoute::ProjectFile("My File.rs".into())
         );
+
+        let outside_file = workspace.join("../kero/src/app.rs");
+        let outside_file_with_line = format!("{}:20", outside_file.display());
         assert_eq!(
-            transcript_link_route(
-                "/Users/egoist/dev/waku/../kero/src/app.rs:20",
-                Some(workspace),
-            ),
-            TranscriptLinkRoute::Finder(PathBuf::from("/Users/egoist/dev/kero/src/app.rs"))
+            transcript_link_route(&outside_file_with_line, Some(workspace)),
+            TranscriptLinkRoute::Finder(normalized_path(&outside_file))
         );
         assert_eq!(
             transcript_link_route("https://example.com/file.rs:12", Some(workspace)),
@@ -1448,23 +1438,31 @@ mod tests {
         assert_eq!(
             collapsed
                 .iter()
-                .map(|entry| entry.relative_path.as_str())
+                .map(|entry| entry.relative_path.clone())
                 .collect::<Vec<_>>(),
-            vec!["src", "README.md"]
+            vec!["src".to_owned(), "README.md".to_owned()]
         );
 
         let expanded = HashSet::from([root.join("src")]);
         let visible = visible_working_tree_entries(&root, &expanded);
+        let nested = Path::new("src")
+            .join("nested")
+            .to_string_lossy()
+            .into_owned();
+        let main_rs = Path::new("src")
+            .join("main.rs")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             visible
                 .iter()
-                .map(|entry| (entry.relative_path.as_str(), entry.depth))
+                .map(|entry| (entry.relative_path.clone(), entry.depth))
                 .collect::<Vec<_>>(),
             vec![
-                ("src", 0),
-                ("src/nested", 1),
-                ("src/main.rs", 1),
-                ("README.md", 0)
+                ("src".to_owned(), 0),
+                (nested, 1),
+                (main_rs, 1),
+                ("README.md".to_owned(), 0)
             ]
         );
 
@@ -1591,6 +1589,21 @@ mod tests {
             right_panel_tab_icon(&file, None),
             "icons/file-types/rust.svg"
         );
+    }
+
+    #[test]
+    fn right_panel_tab_titles_stay_on_one_line() {
+        let source = include_str!("right_panel.rs");
+        let header = source
+            .split_once("\n    fn render_right_panel_header(")
+            .expect("right panel header renderer")
+            .1
+            .split_once("\n    fn render_right_panel_chooser(")
+            .expect("right panel header renderer end")
+            .0;
+
+        assert!(header.contains(".truncate()"));
+        assert!(!header.contains(".line_clamp(1)"));
     }
 
     #[test]
@@ -2242,6 +2255,7 @@ impl Waku {
     fn any_overlay_open(&self, cx: &App) -> bool {
         self.menus.borrow().values().any(ContextMenuHandle::is_open)
             || self.command_palette.is_open()
+            || self.task_switcher.is_open()
             || self.commit_dialog.is_some()
             || self.image_preview.is_some()
             || self.composer.read(cx).context_menu_open(cx)
@@ -2398,9 +2412,8 @@ impl Waku {
                         div()
                             .min_w_0()
                             .flex_1()
-                            .line_clamp(1)
-                            .text_ellipsis()
-                            .text_size(sp(12.0))
+                            .truncate()
+                            .text_size(sp(12.5))
                             .text_color(if active {
                                 theme.text
                             } else {
@@ -2577,7 +2590,7 @@ impl Waku {
                     .child(
                         div()
                             .mt(px(5.0))
-                            .text_size(sp(11.0))
+                            .text_size(sp(12.5))
                             .text_color(theme.text_tertiary)
                             .child(tr!("right_panel.choose_surface")),
                     )
@@ -2658,7 +2671,7 @@ impl Waku {
             .child(
                 div()
                     .mt(px(4.0))
-                    .text_size(sp(10.5))
+                    .text_size(sp(12.5))
                     .line_height(sp(15.0))
                     .text_color(theme.text_tertiary)
                     .whitespace_normal()
@@ -2745,7 +2758,7 @@ impl Waku {
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .text_size(sp(11.5))
+                        .text_size(sp(12.5))
                         .text_color(theme.text_secondary)
                         .child(entry.name),
                 );
@@ -2786,7 +2799,7 @@ impl Waku {
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_size(sp(11.5))
+                            .text_size(sp(12.5))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.text_secondary)
                             .child(project_name),
@@ -2893,7 +2906,7 @@ impl Waku {
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_size(sp(11.0))
+                            .text_size(sp(12.5))
                             .text_color(theme.text_secondary)
                             .child(relative_path.clone()),
                     )
@@ -3622,14 +3635,14 @@ impl Waku {
             .child(source)
             .child(
                 div()
-                    .text_size(sp(11.5))
+                    .text_size(sp(12.5))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.success)
                     .child(format!("+{additions}")),
             )
             .child(
                 div()
-                    .text_size(sp(11.5))
+                    .text_size(sp(12.5))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.danger)
                     .child(format!("-{deletions}")),
@@ -3637,7 +3650,7 @@ impl Waku {
             .when(truncated, |row| {
                 row.child(
                     div()
-                        .text_size(sp(10.5))
+                        .text_size(sp(12.5))
                         .text_color(theme.warning)
                         .child(tr!("diff.truncated")),
                 )
@@ -3725,7 +3738,7 @@ impl Waku {
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .text_size(px(11.5))
+                        .text_size(px(12.5))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.text_secondary)
                         .tooltip(Tooltip::text(file.path.clone()))
@@ -3733,13 +3746,13 @@ impl Waku {
                 )
                 .child(
                     div()
-                        .text_size(px(10.5))
+                        .text_size(px(12.5))
                         .text_color(theme.success)
                         .child(format!("+{}", file.additions)),
                 )
                 .child(
                     div()
-                        .text_size(px(10.5))
+                        .text_size(px(12.5))
                         .text_color(theme.danger)
                         .child(format!("-{}", file.deletions)),
                 )
@@ -3828,7 +3841,7 @@ impl Waku {
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .text_size(px(10.5))
+                    .text_size(px(12.5))
                     .text_color(theme.text_tertiary)
                     .child(gutter)
                     .child(label)
@@ -3841,7 +3854,7 @@ impl Waku {
                 .flex()
                 .items_stretch()
                 .font_family(md::render::MONO_FAMILY)
-                .text_size(px(10.0))
+                .text_size(px(12.5))
                 .line_height(px(16.0))
                 .text_color(theme.text_tertiary)
                 .child(
@@ -3876,7 +3889,7 @@ impl Waku {
                 .flex()
                 .items_stretch()
                 .font_family(md::render::MONO_FAMILY)
-                .text_size(px(10.5))
+                .text_size(px(12.5))
                 .line_height(px(16.0))
                 .text_color(theme.text_tertiary)
                 .child(
@@ -4132,7 +4145,7 @@ impl Waku {
                                 .min_w_0()
                                 .flex_1()
                                 .truncate()
-                                .text_size(sp(11.0))
+                                .text_size(sp(12.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text_secondary)
                                 .child(name),
@@ -4194,7 +4207,7 @@ impl Waku {
                                     .min_w_0()
                                     .flex_1()
                                     .truncate()
-                                    .text_size(sp(11.0))
+                                    .text_size(sp(12.5))
                                     .text_color(if selected {
                                         theme.text
                                     } else {
@@ -4205,8 +4218,8 @@ impl Waku {
                             )
                             .child(
                                 div()
-                                    .w(px(16.0))
-                                    .h(px(16.0))
+                                    .w(px(18.0))
+                                    .h(px(18.0))
                                     .flex_none()
                                     .rounded(px(4.0))
                                     .border_1()
@@ -4214,7 +4227,7 @@ impl Waku {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(sp(9.0))
+                                    .text_size(sp(12.5))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(status_color)
                                     .child(status),
@@ -4259,7 +4272,7 @@ impl Waku {
                     .mt(px(6.0))
                     .max_w(px(300.0))
                     .text_center()
-                    .text_size(sp(11.0))
+                    .text_size(sp(12.5))
                     .line_height(sp(17.0))
                     .text_color(theme.text_tertiary)
                     .child(description),

@@ -18,7 +18,7 @@ use crate::{Command, DaemonExposureSettings, DaemonSettings, DaemonSupervisor, R
 use waku_protocol::computer_use::ComputerAppGrant;
 use waku_protocol::i18n::AppLanguage;
 use waku_protocol::identity::DATA_DIRECTORY_NAME;
-use waku_protocol::model::{AgentSession, FavoriteModel, Project, ProviderKind};
+use waku_protocol::model::{AgentSession, FavoriteModel, Project, ProviderKind, RuntimeMode};
 use waku_protocol::theme::ThemePreference;
 
 pub use waku_protocol::persistence::{
@@ -31,6 +31,24 @@ const APP_STATE_VERSION: u32 = 1;
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 252.0;
 pub const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 460.0;
+
+/// How the desktop groups task history in the sidebar.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarGrouping {
+    Project,
+    #[default]
+    Updated,
+}
+
+/// Direction of task history inside the sidebar's current grouping.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarOrdering {
+    #[default]
+    Newest,
+    Oldest,
+}
 
 fn default_sidebar_visibility() -> bool {
     true
@@ -284,6 +302,8 @@ struct AppState {
     selected_session: Option<Uuid>,
     #[serde(default = "default_provider")]
     last_provider: ProviderKind,
+    #[serde(default)]
+    last_runtime_mode: RuntimeMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,6 +320,10 @@ struct AppState {
     right_panel_visible: bool,
     #[serde(default = "default_sidebar_width")]
     sidebar_width: f32,
+    #[serde(default)]
+    sidebar_grouping: SidebarGrouping,
+    #[serde(default)]
+    sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
     right_panel_width: f32,
     /// Whether markdown files in the right panel open as a rendered preview
@@ -322,6 +346,8 @@ pub struct PersistedState {
     pub selected_project: Option<Uuid>,
     pub selected_session: Option<Uuid>,
     pub last_provider: ProviderKind,
+    #[serde(default)]
+    pub last_runtime_mode: RuntimeMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -352,6 +378,10 @@ pub struct PersistedState {
     pub right_panel_visible: bool,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    #[serde(default)]
+    pub sidebar_grouping: SidebarGrouping,
+    #[serde(default)]
+    pub sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
     pub right_panel_width: f32,
     /// Whether markdown files in the right panel open as a rendered preview
@@ -400,6 +430,7 @@ impl PersistedState {
             selected_project: None,
             selected_session: None,
             last_provider: ProviderKind::Codex,
+            last_runtime_mode: RuntimeMode::default(),
             last_model: None,
             last_reasoning_effort: None,
             last_service_tier: None,
@@ -415,6 +446,8 @@ impl PersistedState {
             sidebar_visible: true,
             right_panel_visible: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_grouping: SidebarGrouping::Updated,
+            sidebar_ordering: SidebarOrdering::Newest,
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             markdown_preview: false,
             window_state: None,
@@ -441,6 +474,7 @@ impl PersistedState {
 
     pub fn new_session(&self, project_id: Uuid, provider: ProviderKind) -> AgentSession {
         let mut session = AgentSession::new(project_id, provider);
+        session.runtime_mode = self.last_runtime_mode;
         if provider == self.last_provider {
             session.model.clone_from(&self.last_model);
             session
@@ -542,6 +576,7 @@ impl PersistedState {
             selected_project: self.selected_project,
             selected_session: self.persistable_selected_session(),
             last_provider: self.last_provider,
+            last_runtime_mode: self.last_runtime_mode,
             last_model: self.last_model.clone(),
             last_reasoning_effort: self.last_reasoning_effort.clone(),
             last_service_tier: self.last_service_tier.clone(),
@@ -550,6 +585,8 @@ impl PersistedState {
             sidebar_visible: self.sidebar_visible,
             right_panel_visible: self.right_panel_visible,
             sidebar_width: self.sidebar_width,
+            sidebar_grouping: self.sidebar_grouping,
+            sidebar_ordering: self.sidebar_ordering,
             right_panel_width: self.right_panel_width,
             markdown_preview: self.markdown_preview,
             window_state: self.window_state,
@@ -572,6 +609,7 @@ impl PersistedState {
         self.selected_project = app_state.selected_project;
         self.selected_session = app_state.selected_session;
         self.last_provider = app_state.last_provider;
+        self.last_runtime_mode = app_state.last_runtime_mode;
         self.last_model = app_state.last_model;
         self.last_reasoning_effort = app_state.last_reasoning_effort;
         self.last_service_tier = app_state.last_service_tier;
@@ -580,6 +618,8 @@ impl PersistedState {
         self.sidebar_visible = app_state.sidebar_visible;
         self.right_panel_visible = app_state.right_panel_visible;
         self.sidebar_width = app_state.sidebar_width;
+        self.sidebar_grouping = app_state.sidebar_grouping;
+        self.sidebar_ordering = app_state.sidebar_ordering;
         self.right_panel_width = app_state.right_panel_width;
         self.markdown_preview = app_state.markdown_preview;
         self.window_state = app_state.window_state;
@@ -1060,6 +1100,26 @@ mod tests {
                 [configuration_directory().join("settings.json")]
             );
         }
+    }
+
+    #[test]
+    fn legacy_app_state_defaults_sidebar_presentation() {
+        let state: AppState = serde_json::from_str(r#"{"app_state_version":1}"#).unwrap();
+
+        assert_eq!(state.sidebar_grouping, SidebarGrouping::Updated);
+        assert_eq!(state.sidebar_ordering, SidebarOrdering::Newest);
+        assert_eq!(state.last_runtime_mode, RuntimeMode::FullAccess);
+    }
+
+    #[test]
+    fn new_tasks_inherit_the_remembered_access_mode() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.last_runtime_mode = RuntimeMode::Ask;
+
+        let session = state.new_session(state.projects[0].id, ProviderKind::OpenCode);
+
+        assert_eq!(session.runtime_mode, RuntimeMode::Ask);
+        assert_eq!(state.app_state().last_runtime_mode, RuntimeMode::Ask);
     }
 
     #[test]
