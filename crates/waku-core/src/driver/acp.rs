@@ -1120,7 +1120,7 @@ async fn apply_model(
         // stays on session/set_config_option, its documented model API.
         let request = match UntypedMessage::new(
             "session/set_model",
-            json!({"sessionId": session_id, "modelId": model}),
+            set_model_params(session_id, model, reasoning_effort, provider),
         ) {
             Ok(request) => request,
             Err(error) => {
@@ -1132,15 +1132,6 @@ async fn apply_model(
             }
         };
         if let Err(error) = connection.send_request(request).block_task().await {
-    // Grok, Kimi, OpenCode, and Cursor agents that do not advertise a model
-    // config option retain the legacy request unchanged. Fx intentionally
-    // stays on session/set_config_option, its documented model API.
-    let request = match UntypedMessage::new(
-        "session/set_model",
-        set_model_params(session_id, model, reasoning_effort, provider),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
             let _ = events.send(DriverEvent::Error(tr!(
                 "errors.select_model",
                 error = error
@@ -1149,7 +1140,6 @@ async fn apply_model(
         }
     }
 
-    if let Some(effort) = reasoning_effort {
     if provider != ProviderKind::Grok
         && let Some(effort) = reasoning_effort
     {
