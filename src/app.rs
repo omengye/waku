@@ -560,7 +560,7 @@ struct DriverStartRequest {
     provider: ProviderKind,
     options: DriverStartOptions,
     event_wake: smol::channel::Sender<()>,
-    daemon_client: waku_client::DaemonClient,
+    daemon: waku_client::DaemonSupervisor,
 }
 
 /// A provider process that has started off-thread but is not installed into
@@ -1211,22 +1211,38 @@ pub struct Waku {
     /// Window-modal Git commit/push UI. Its repository snapshot is filled
     /// off-thread; frames only read this in-memory value.
     commit_dialog: Option<commit_dialog::CommitDialogState>,
+    goal_dialog: Option<goal_dialog::GoalDialogState>,
+    goal_dialog_request: Option<goal_dialog::GoalDialogRequest>,
+    /// Goal operations accepted before the session's runtime exists. Goals
+    /// attach to the provider thread, not to any turn, so `/goal` on a fresh
+    /// task starts the provider and these drain once it installs.
+    pending_goal_operations: HashMap<Uuid, Vec<crate::model::GoalOperation>>,
+    /// Sessions whose runtime is being started by a goal operation rather
+    /// than a submission. Submissions queue behind this instead of racing a
+    /// second provider process into existence.
+    goal_runtime_starts: HashSet<Uuid>,
+    /// When each session's goal accounting was last reported. The chip adds
+    /// the wall clock since then while an active goal's turn runs, so elapsed
+    /// pursuit time ticks live the way the Codex CLI shows it.
+    goal_observed_at: HashMap<Uuid, Instant>,
     /// Commit-message generation and Git mutation outlive the modal that
     /// started them. Keeping the operation on the app also lets every
     /// Environment surface reflect and gate the same in-flight action.
     commit_operation: Option<commit_dialog::CommitOperationState>,
-    /// Slash commands discovered per (provider, project root). Filesystem
-    /// walks live on the background executor; frames read the index below.
-    slash_commands: QueryCache<(ProviderKind, PathBuf), Vec<SlashCommand>>,
+    /// Slash commands discovered per (provider, project root, CLI override).
+    /// Filesystem and CLI probes live off the UI thread; frames read this cache.
+    slash_commands: QueryCache<(ProviderKind, PathBuf, Option<String>), Vec<SlashCommand>>,
     /// The merged command list the autocomplete popup draws, and the key it
     /// was built for — a stale key means "no commands", never another
     /// provider's list.
     slash_command_index: Rc<Vec<SlashCommand>>,
-    slash_command_index_key: Option<(ProviderKind, PathBuf)>,
+    slash_command_index_key: Option<(ProviderKind, PathBuf, Option<String>)>,
+    slash_command_index_loading: bool,
     /// Workspace file index per project root, for `@` mentions.
     mention_files: QueryCache<PathBuf, Vec<FileEntry>>,
     mention_file_index: Rc<Vec<FileEntry>>,
     mention_file_index_path: Option<PathBuf>,
+    mention_file_index_loading: bool,
     /// Set when a driver reports its command registry mid-drain; the drain
     /// has no `Context` to rebuild the drawn index itself.
     composer_sources_stale: bool,
@@ -1476,6 +1492,10 @@ pub struct Waku {
     assistant_footer_cache: RefCell<HashMap<usize, (Option<SharedString>, Option<u64>)>>,
     /// The row-kinds fingerprint `assistant_footer_cache` was built under.
     assistant_footer_fingerprint: Cell<Option<u64>>,
+    /// The response row currently under the pointer. Response footers are
+    /// separate virtual-list rows, so GPUI's ancestor-scoped `group_hover`
+    /// cannot reveal them when a sibling response row is hovered.
+    hovered_response_row: Option<(Uuid, TranscriptRowKind)>,
     /// Checkpoint-ref existence per (session, retained turn count), filled by
     /// `prefetch_checkpoint_refs` on the background executor. Rows read only
     /// this cache: resolving a ref forks a `git` subprocess, which must stay
@@ -1581,6 +1601,7 @@ mod background_work;
 mod branches;
 mod command_palette;
 mod commit_dialog;
+mod goal_dialog;
 mod components;
 mod composer;
 mod drafts;
@@ -1608,6 +1629,7 @@ use background_work::{
 };
 pub use command_palette::init as init_command_palette;
 pub use commit_dialog::init as init_commit_dialog_keys;
+pub use goal_dialog::init as init_goal_dialog_keys;
 use components::*;
 pub use image_preview::init as init_image_preview_keys;
 pub use settings::init as init_settings_keys;
@@ -2774,15 +2796,22 @@ impl Waku {
                 visible_branch_snapshot: None,
                 branch_operation_pending: false,
                 commit_dialog: None,
+                goal_dialog: None,
+                goal_dialog_request: None,
+                pending_goal_operations: HashMap::new(),
+                goal_runtime_starts: HashSet::new(),
+                goal_observed_at: HashMap::new(),
                 commit_operation: None,
                 // Providers × workspaces; both scans are small, the cache
                 // only exists to keep them off the frame path.
                 slash_commands: QueryCache::new(2 * MAX_CACHED_WORKSPACES),
                 slash_command_index: Rc::new(Vec::new()),
                 slash_command_index_key: None,
+                slash_command_index_loading: false,
                 mention_files: QueryCache::new(MAX_CACHED_WORKSPACES),
                 mention_file_index: Rc::new(Vec::new()),
                 mention_file_index_path: None,
+                mention_file_index_loading: false,
                 composer_sources_stale: false,
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
@@ -2924,6 +2953,7 @@ impl Waku {
                 transcript_navigation_turns_fingerprint: Cell::new(None),
                 assistant_footer_cache: RefCell::new(HashMap::new()),
                 assistant_footer_fingerprint: Cell::new(None),
+                hovered_response_row: None,
                 checkpoint_ref_cache: RefCell::new(HashMap::new()),
                 checkpoint_ref_generation: Cell::new(0),
                 checkpoint_ref_prefetch: Cell::new(None),

@@ -195,6 +195,7 @@ const ICONS: &[(&str, &[u8])] = icons![
     "star-filled",
     "stop",
     "stop-filled",
+    "target",
     "terminal",
     "terminal-square",
     "trash",
