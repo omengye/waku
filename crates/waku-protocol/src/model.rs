@@ -3992,6 +3992,7 @@ mod tests {
         assert_eq!(ProviderKind::Fx.command(), "fx");
         assert_eq!(ProviderKind::OpenCode.command(), "opencode");
         assert_eq!(ProviderKind::Grok.command(), "grok");
+        assert_eq!(ProviderKind::OhMyPi.command(), "omp");
         assert_eq!(ProviderKind::Pi.command(), "pi");
         assert_eq!(ProviderKind::DeerFlow.command(), "deerflow-acp");
     }
@@ -4006,6 +4007,7 @@ mod tests {
             ProviderKind::DeepSeek,
             ProviderKind::OpenCode,
             ProviderKind::Grok,
+            ProviderKind::OhMyPi,
             ProviderKind::Pi,
             ProviderKind::DeerFlow,
         ] {
@@ -4028,6 +4030,7 @@ mod tests {
         assert!(ProviderKind::Fx.supports_model_discovery());
         assert!(ProviderKind::OpenCode.supports_model_discovery());
         assert!(ProviderKind::Grok.supports_model_discovery());
+        assert!(ProviderKind::OhMyPi.supports_model_discovery());
         assert!(ProviderKind::Pi.supports_model_discovery());
         assert!(!ProviderKind::DeerFlow.supports_model_discovery());
     }
