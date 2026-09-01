@@ -2582,7 +2582,6 @@ impl Waku {
         });
         SessionOptions {
             mode: session.runtime_mode,
-            interaction_mode: session.interaction_mode,
             model,
             reasoning_effort,
             service_tier,
@@ -2707,7 +2706,6 @@ impl Waku {
         let agent_preset = self.agent_preset_for_session(session);
         let SessionOptions {
             mode,
-            interaction_mode,
             model,
             reasoning_effort,
             service_tier,
@@ -2720,7 +2718,6 @@ impl Waku {
                 binary,
                 cwd,
                 mode,
-                interaction_mode,
                 model,
                 reasoning_effort,
                 service_tier,
