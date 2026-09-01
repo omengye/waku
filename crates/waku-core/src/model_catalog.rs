@@ -12,6 +12,7 @@ use crate::model::{ProviderAgentPreset, ProviderKind, ProviderModel, ProviderMod
 
 const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const PI_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+const ACP_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
     match provider {
@@ -84,14 +85,12 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         // model the user configured. An invented fallback would offer a model
         // the CLI rejects, so discovery is authoritative.
         ProviderKind::Grok => Vec::new(),
-        // Pi, Oh My Pi, and Kimi Code all take their catalog from the user's
+        // Pi, Oh My Pi, DeerFlow, and Kimi Code all take their catalog from the user's
         // configured LLM providers. A fabricated fallback would make
         // unavailable models look selectable.
-        ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi => Vec::new(),
-        ProviderKind::DeerFlow => vec![
-            ProviderModel::new("deepseek-v4-flash", "DeepSeek V4 Flash").default(),
-            ProviderModel::new("gemini-3.6-flash-high", "Gemini 3.6 Flash (High)"),
-        ],
+        ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi | ProviderKind::DeerFlow => {
+            Vec::new()
+        }
     }
 }
 
@@ -130,7 +129,7 @@ pub fn discover_catalog(
         ProviderKind::Fx => (discover_fx_models(binary), None),
         ProviderKind::OpenCode => (discover_opencode_models(binary), None),
         ProviderKind::Grok => (discover_grok_models(binary), None),
-        ProviderKind::DeerFlow => (Vec::new(), None),
+        ProviderKind::DeerFlow => (discover_deerflow_models(binary), None),
         ProviderKind::Kimi => (discover_kimi_models(binary), None),
         ProviderKind::Pi => (discover_pi_models(binary, PiDialect::Pi), None),
         ProviderKind::OhMyPi => (discover_pi_models(binary, PiDialect::OhMyPi), None),
@@ -181,7 +180,7 @@ fn read_models_file(path: &Path) -> Option<Vec<ProviderModel>> {
 
 /// Best-effort: a cache that fails to write only costs the next launch its
 /// head start.
-fn write_cached_models(provider: ProviderKind, models: &[ProviderModel]) {
+pub(crate) fn write_cached_models(provider: ProviderKind, models: &[ProviderModel]) {
     let _ = write_models_file(&model_cache_path(provider), models);
 }
 
@@ -594,6 +593,60 @@ fn parse_grok_models(output: &str) -> Vec<ProviderModel> {
             Some(grok_reasoning_model(model))
         })
         .collect()
+}
+
+/// DeerFlow ACP agent exposes its configured models through the standard ACP
+/// session initialization handshake in `session/new` `configOptions`.
+fn discover_deerflow_models(binary: &Path) -> Vec<ProviderModel> {
+    let cwd = match crate::acp_session::catalog_working_directory() {
+        Ok(cwd) => cwd,
+        Err(_) => return Vec::new(),
+    };
+    let agent = match crate::driver::catalog_agent(ProviderKind::DeerFlow, binary, &cwd) {
+        Ok(agent) => agent,
+        Err(_) => return Vec::new(),
+    };
+
+    let client_info = agent_client_protocol::schema::v1::Implementation::new("waku", env!("CARGO_PKG_VERSION"));
+    let client_capabilities = agent_client_protocol::schema::v1::ClientCapabilities::new().terminal(false);
+    let initialize_req = agent_client_protocol::schema::v1::InitializeRequest::new(
+        agent_client_protocol::schema::ProtocolVersion::V1,
+    )
+    .client_capabilities(client_capabilities)
+    .client_info(client_info);
+
+    let session_cwd = cwd.clone();
+    let probe = agent_client_protocol::Client.builder().name("waku-model-probe").connect_with(
+        agent,
+        async move |connection: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>| {
+            let _ = connection.send_request(initialize_req).block_task().await?;
+            let new_session = connection
+                .send_request(agent_client_protocol::schema::v1::NewSessionRequest::new(&session_cwd))
+                .block_task()
+                .await?;
+            let mut models = Vec::new();
+            if let Some(options) = new_session.config_options {
+                if let Some(model_option) = options.iter().find(|opt| {
+                    opt.id.to_string().eq_ignore_ascii_case("model")
+                        || opt.category
+                            == Some(agent_client_protocol::schema::v1::SessionConfigOptionCategory::Model)
+                }) {
+                    models = crate::driver::parse_acp_config_models(model_option);
+                }
+            }
+            Ok(models)
+        },
+    );
+
+    let result = smol::block_on(smol::future::race(
+        async move { probe.await.map_err(anyhow::Error::new) },
+        async move {
+            smol::Timer::after(ACP_RPC_TIMEOUT).await;
+            Err(anyhow::anyhow!("DeerFlow ACP model probe timed out"))
+        },
+    ));
+
+    result.unwrap_or_default()
 }
 
 /// Kimi Code resolves models through its own provider config, which covers the
@@ -1176,7 +1229,7 @@ fn normalize_codex_name(name: &str) -> String {
         .collect()
 }
 
-fn display_name_from_slug(slug: &str) -> String {
+pub(crate) fn display_name_from_slug(slug: &str) -> String {
     let words = slug
         .split(['-', '_'])
         .filter(|part| !part.is_empty())

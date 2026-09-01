@@ -34,8 +34,8 @@ use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
 use crate::model::{
-    ActivityKind, DriverEvent, PermissionOption, ProviderKind, ProviderResumeCursor, RuntimeMode,
-    UserInputAnswer, UserInputOption, UserInputQuestion,
+    ActivityKind, DriverEvent, PermissionOption, ProviderKind, ProviderModel, ProviderResumeCursor,
+    RuntimeMode, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 
 enum CommandMessage {
@@ -514,6 +514,20 @@ async fn run_sdk_connection(
             )
             .await?;
 
+            if provider == ProviderKind::DeerFlow
+                && let Some(options) = config_options.as_deref()
+            {
+                if let Some(model_option) = options.iter().find(|opt| {
+                    opt.id.to_string().eq_ignore_ascii_case("model")
+                        || opt.category == Some(SessionConfigOptionCategory::Model)
+                }) {
+                    let models = parse_acp_config_models(model_option);
+                    if !models.is_empty() {
+                        crate::model_catalog::write_cached_models(provider, &models);
+                    }
+                }
+            }
+
             if let Some(mode_id) = desired_access_mode(provider, modes.as_ref(), mode) {
                 // Mode selection is opportunistic: an agent can advertise a
                 // mode but reject a later transition without invalidating the
@@ -979,6 +993,50 @@ fn fx_model_option(config_options: &[SessionConfigOption]) -> Option<&SessionCon
         option.category == Some(SessionConfigOptionCategory::Model)
             && option.id.to_string().eq_ignore_ascii_case("model")
     })
+}
+
+pub(crate) fn parse_acp_config_models(option: &SessionConfigOption) -> Vec<ProviderModel> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    let current_value = select.current_value.0.as_ref();
+    let mut models = Vec::new();
+
+    let extract_model = |value: &str, name: &str| {
+        let (sub_provider, model_id) = value
+            .split_once('/')
+            .map_or((None, value), |(p, m)| (Some(p), m));
+        let display_name = if name.is_empty() || name == value {
+            crate::model_catalog::display_name_from_slug(model_id)
+        } else {
+            name.to_owned()
+        };
+        let mut model = ProviderModel::new(value, display_name);
+        if let Some(sub) = sub_provider.filter(|s| !s.is_empty()) {
+            model = model.sub_provider(crate::model_catalog::display_name_from_slug(sub));
+        }
+        if value == current_value {
+            model = model.default();
+        }
+        model
+    };
+
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => {
+            for opt in options {
+                models.push(extract_model(opt.value.0.as_ref(), &opt.name));
+            }
+        }
+        SessionConfigSelectOptions::Grouped(groups) => {
+            for group in groups {
+                for opt in &group.options {
+                    models.push(extract_model(opt.value.0.as_ref(), &opt.name));
+                }
+            }
+        }
+        _ => {}
+    }
+    models
 }
 
 fn fx_model_provider_switch<'a>(
@@ -2461,6 +2519,24 @@ mod tests {
         );
         assert_eq!(params["modelId"], "grok-4.6");
         assert_eq!(params["_meta"]["reasoningEffort"], "xhigh");
+    }
+
+    #[test]
+    fn deerflow_acp_config_models_are_parsed_correctly() {
+        let option = select_config_option(
+            "model",
+            SessionConfigOptionCategory::Model,
+            "deepseek-v4-flash",
+            &["deepseek-v4-flash", "gemini-3.6-flash-high", "claude-sonnet-4-6"],
+        );
+        let models = parse_acp_config_models(&option);
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "deepseek-v4-flash");
+        assert!(models[0].is_default);
+        assert_eq!(models[1].id, "gemini-3.6-flash-high");
+        assert!(!models[1].is_default);
+        assert_eq!(models[2].id, "claude-sonnet-4-6");
+        assert!(!models[2].is_default);
     }
 
     #[test]

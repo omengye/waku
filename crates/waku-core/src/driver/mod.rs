@@ -12,7 +12,7 @@ mod pi;
 mod support;
 mod title_refresh;
 
-pub(crate) use acp::catalog_agent;
+pub(crate) use acp::{catalog_agent, parse_acp_config_models};
 
 use std::path::PathBuf;
 use std::sync::Arc;

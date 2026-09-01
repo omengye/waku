@@ -161,6 +161,7 @@ impl ProviderKind {
                 | Self::Kimi
                 | Self::OhMyPi
                 | Self::Pi
+                | Self::DeerFlow
         )
     }
 }
@@ -4030,7 +4031,7 @@ mod tests {
         assert!(ProviderKind::Grok.supports_model_discovery());
         assert!(ProviderKind::OhMyPi.supports_model_discovery());
         assert!(ProviderKind::Pi.supports_model_discovery());
-        assert!(!ProviderKind::DeerFlow.supports_model_discovery());
+        assert!(ProviderKind::DeerFlow.supports_model_discovery());
     }
 
     #[test]
