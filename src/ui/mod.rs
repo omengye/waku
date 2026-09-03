@@ -204,6 +204,7 @@ pub fn status_color(theme: &Theme, status: SessionStatus) -> Hsla {
     match status {
         SessionStatus::Idle => theme.text_ghost,
         SessionStatus::Connecting | SessionStatus::Working => theme.accent,
+        SessionStatus::Background => theme.text_secondary,
         SessionStatus::Waiting => theme.warning,
         SessionStatus::Failed => theme.danger,
     }
@@ -497,6 +498,7 @@ mod tests {
             "icons/laptop.svg",
             "icons/file-diff.svg",
             "icons/globe.svg",
+            "icons/hourglass.svg",
             "icons/alert.svg",
             "icons/lock.svg",
             "icons/lock-open.svg",
