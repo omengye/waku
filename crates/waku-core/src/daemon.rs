@@ -466,9 +466,7 @@ impl Backend for WakuBackend {
                     }
                     ProviderKind::Cursor
                     | ProviderKind::Fx
-                    | ProviderKind::OpenCode
                     | ProviderKind::DeerFlow => {
-                    ProviderKind::Cursor | ProviderKind::Fx => {
                         crate::acp_session::list_provider_sessions(provider, &binary, &[], limit)?
                     }
                     ProviderKind::OpenCode => {

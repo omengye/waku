@@ -54,6 +54,10 @@ enum CommandMessage {
     Shutdown,
 }
 
+fn close_command_loop(commands: &smol::channel::Receiver<CommandMessage>) {
+    commands.close();
+}
+
 pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
     supports_steer: bool,
@@ -365,10 +369,18 @@ async fn run_sdk_connection(
     let prompt_requests = Arc::new(Mutex::new(PendingPrompts::default()));
     let title_refresh = super::title_refresh::NativeTitleRefresh::default();
     let auto_approve = mode != RuntimeMode::Ask;
+    let close_commands = commands.clone();
 
     Client
         .builder()
         .name("waku")
+        .on_close(async move |_connection| {
+            // `connect_with` does not cancel its foreground future on incoming
+            // EOF. Close the receiver so an idle command loop wakes and lets
+            // the outer driver thread publish `ProcessExited`.
+            close_command_loop(&close_commands);
+            Ok(())
+        })
         .on_receive_notification(
             {
                 let events = events.clone();
@@ -2037,6 +2049,16 @@ mod tests {
         SessionConfigSelectOption, SessionMode, SessionModeState, ToolCallUpdate,
         ToolCallUpdateFields,
     };
+
+    #[test]
+    fn closing_transport_wakes_an_idle_command_loop() {
+        let (commands, command_rx) = smol::channel::bounded(1);
+
+        close_command_loop(&command_rx);
+
+        assert!(smol::block_on(command_rx.recv()).is_err());
+        assert!(commands.try_send(CommandMessage::Cancel).is_err());
+    }
 
     fn select_config_option(
         id: &str,

@@ -128,6 +128,8 @@ pub fn parse_allowed_origins(text: &str) -> anyhow::Result<Vec<String>> {
 
 pub struct DaemonProcess {
     client: DaemonClient,
+    address: String,
+    token: String,
     child: Child,
 }
 
@@ -224,7 +226,7 @@ impl DaemonProcess {
                 return Err(error);
             }
         };
-        let client = match DaemonClient::connect(&client_address, token) {
+        let client = match DaemonClient::connect(&client_address, token.clone()) {
             Ok(client) => client,
             Err(error) => {
                 let _ = child.kill();
@@ -232,7 +234,12 @@ impl DaemonProcess {
                 return Err(error);
             }
         };
-        Ok(Self { client, child })
+        Ok(Self {
+            client,
+            address: client_address,
+            token,
+            child,
+        })
     }
 
     pub fn client(&self) -> DaemonClient {
@@ -284,6 +291,23 @@ fn desktop_client_address(address: &str) -> anyhow::Result<String> {
 struct ExecutableStamp {
     modified: Option<SystemTime>,
     len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalDaemonRecovery {
+    None,
+    Reconnect,
+    Restart,
+}
+
+fn local_daemon_recovery(process_exited: bool, client_disconnected: bool) -> LocalDaemonRecovery {
+    if process_exited {
+        LocalDaemonRecovery::Restart
+    } else if client_disconnected {
+        LocalDaemonRecovery::Reconnect
+    } else {
+        LocalDaemonRecovery::None
+    }
 }
 
 impl ExecutableStamp {
@@ -558,11 +582,67 @@ fn monitor_daemon(
                 .retain(|subscriber| subscriber.send(replacement.clone()).is_ok());
             continue;
         }
-        let process_exited = match &mut *inner.target.lock() {
-            DaemonTarget::Local(process) => process.has_exited(),
-            DaemonTarget::Restarting(_) => true,
-            DaemonTarget::Remote { .. } => continue,
+        // A dropped desktop socket does not mean the daemon or its provider
+        // runtimes exited. Reconnect to the live child first so an otherwise
+        // healthy provider turn survives the transport failure.
+        let (local_recovery, local_reconnect) = {
+            let mut target = inner.target.lock();
+            match &mut *target {
+                DaemonTarget::Local(process) => {
+                    let recovery = local_daemon_recovery(
+                        process.has_exited(),
+                        process.client.is_disconnected(),
+                    );
+                    let reconnect = (recovery == LocalDaemonRecovery::Reconnect).then(|| {
+                        (
+                            process.client.clone(),
+                            process.address.clone(),
+                            process.token.clone(),
+                            process.client.last_sequences(),
+                        )
+                    });
+                    (recovery, reconnect)
+                }
+                DaemonTarget::Restarting(_) => (LocalDaemonRecovery::Restart, None),
+                DaemonTarget::Remote { .. } => continue,
+            }
         };
+        if let Some((disconnected, address, token, resume_from)) = local_reconnect {
+            let _restart = inner.restart.lock();
+            let still_current = matches!(
+                &*inner.target.lock(),
+                DaemonTarget::Local(process)
+                    if process.client.same_connection(&disconnected)
+                        && process.client.is_disconnected()
+            );
+            if !still_current {
+                continue;
+            }
+            if let Ok(replacement) = DaemonClient::connect_with_resume(&address, token, resume_from)
+            {
+                let installed = {
+                    let mut target = inner.target.lock();
+                    match &mut *target {
+                        DaemonTarget::Local(process)
+                            if process.client.same_connection(&disconnected) =>
+                        {
+                            process.client = replacement.clone();
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if installed {
+                    inner
+                        .client_updates
+                        .lock()
+                        .retain(|subscriber| subscriber.send(replacement.clone()).is_ok());
+                    queue_settings_refresh(&inner);
+                }
+                continue;
+            }
+        }
+        let process_exited = local_recovery == LocalDaemonRecovery::Restart;
         let Some(executable) = inner.executable.as_ref() else {
             return;
         };
@@ -710,5 +790,21 @@ mod tests {
             "127.0.0.1:34123"
         );
         assert_eq!(desktop_client_address("[::]:34123").unwrap(), "[::1]:34123");
+    }
+
+    #[test]
+    fn live_local_daemon_with_a_dropped_client_reconnects_without_restart() {
+        assert_eq!(
+            local_daemon_recovery(false, true),
+            LocalDaemonRecovery::Reconnect
+        );
+        assert_eq!(
+            local_daemon_recovery(true, true),
+            LocalDaemonRecovery::Restart
+        );
+        assert_eq!(
+            local_daemon_recovery(false, false),
+            LocalDaemonRecovery::None
+        );
     }
 }
