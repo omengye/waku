@@ -1,6 +1,7 @@
 import { useQueryClient } from '@tanstack/react-query';
 import type {
   AgentSession,
+  MessageAttachment,
   PendingPermission,
   PendingUserInput,
   ProviderKind,
@@ -38,19 +39,26 @@ import {
   applySessionOptions,
   beginTurn,
   createSession,
+  providerPromptForSubmission,
   queueSubmission,
   sessionBusy,
   sessionCwd,
+  sessionIsRunning,
   shouldApplyRuntimeEvent,
   submittedTurnIdentity,
   type NewSessionOptions,
   type SessionOptionChanges,
 } from './mobile-runtime';
+import {
+  clearDaemonDisconnectErrors,
+  isDaemonDisconnectError,
+} from './runtime-errors';
 
 export interface MobileRuntime {
   runtimeId: string;
   supportsSteer: boolean;
   starting: boolean;
+  running: boolean;
 }
 
 interface RuntimeEntry extends MobileRuntime {
@@ -60,6 +68,12 @@ interface RuntimeEntry extends MobileRuntime {
   pending: SequencedEvent[];
   flushTimer: ReturnType<typeof setTimeout> | null;
   lastFlushAt: number;
+}
+
+interface PendingSubmission {
+  providerPrompt: string;
+  displayContent: string;
+  attachments: MessageAttachment[];
 }
 
 /** Stream deltas commit at ≤ ~8.3 Hz, the desktop stream pump's cadence: the
@@ -78,8 +92,18 @@ interface RuntimeContextValue {
   userInputs: Record<string, PendingUserInput | undefined>;
   errors: Record<string, string | undefined>;
   attachSession: (session: AgentSession) => Promise<boolean>;
-  sendPrompt: (session: AgentSession, prompt: string) => Promise<AgentSession>;
-  steerPrompt: (session: AgentSession, prompt: string) => Promise<void>;
+  sendPrompt: (
+    session: AgentSession,
+    prompt: string,
+    attachments?: MessageAttachment[],
+    providerPromptOverride?: string,
+  ) => Promise<AgentSession>;
+  steerPrompt: (
+    session: AgentSession,
+    prompt: string,
+    attachments?: MessageAttachment[],
+    providerPromptOverride?: string,
+  ) => Promise<void>;
   createTask: (
     projectId: string,
     provider: ProviderKind,
@@ -115,18 +139,27 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const [permissions, setPermissions] = useState<Record<string, PendingPermission | undefined>>({});
   const [userInputs, setUserInputs] = useState<Record<string, PendingUserInput | undefined>>({});
   const [errors, setErrors] = useState<Record<string, string | undefined>>({});
+  const hasRecoveredDisconnectError = daemon.phase === 'connected'
+    && Object.values(errors).some(isDaemonDisconnectError);
   const entries = useRef(new Map<string, RuntimeEntry>());
   const attachRequests = useRef(new Map<string, Promise<boolean>>());
+  /** The daemon connection count whose runtimes were last revalidated. */
+  const revalidatedConnections = useRef(0);
   const persistTails = useRef(new Map<string, Promise<AgentSession>>());
   const persistTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   /** Advanced on every cache write of new local state, so a save reply that
    * lands after newer runtime events cannot roll the cache back to the
    * snapshot it saved. */
   const cacheGenerations = useRef(new Map<string, number>());
-  const pendingSteers = useRef(new Map<string, string[]>());
+  const pendingSteers = useRef(new Map<string, PendingSubmission[]>());
   const drainingQueues = useRef(new Set<string>());
   const sendPromptRef = useRef<
-    ((session: AgentSession, prompt: string) => Promise<AgentSession>) | null
+    ((
+      session: AgentSession,
+      prompt: string,
+      attachments?: MessageAttachment[],
+      providerPromptOverride?: string,
+    ) => Promise<AgentSession>) | null
   >(null);
 
   /** Writes a session into the query cache without advancing its
@@ -150,6 +183,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       session.id,
       (cacheGenerations.current.get(session.id) ?? 0) + 1,
     );
+    const entry = entries.current.get(session.id);
+    const running = sessionIsRunning(session);
+    if (entry && entry.running !== running) {
+      entry.running = running;
+      setRuntimes((current) => ({ ...current, [session.id]: publicRuntime(entry) }));
+    }
     writeSessionCache(session);
   }, [writeSessionCache]);
 
@@ -245,7 +284,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       };
       cacheSession(dequeued);
       const persisted = await persistOrdered(dequeued);
-      await sendPromptRef.current?.(persisted, next.display_content ?? next.content);
+      await sendPromptRef.current?.(
+        persisted,
+        next.display_content ?? next.content,
+        next.attachments ?? [],
+        next.content,
+      );
     } catch (cause) {
       setErrors((values) => ({ ...values, [sessionId]: errorMessage(cause) }));
     } finally {
@@ -269,6 +313,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       runtimeId,
       supportsSteer,
       starting,
+      running: sessionIsRunning(session),
       lastDriverError: null,
       unsubscribe: () => {},
       pending: [],
@@ -299,7 +344,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         // here; another client's is not, and its message belongs in this
         // transcript just the same — the desktop mirrors it too.
         const pending = pendingSteers.current.get(session.id)?.shift();
-        const content = payload.message ?? pending;
+        const content = payload.message ?? pending?.providerPrompt;
         if (content) {
           state.current = {
             ...state.current,
@@ -310,6 +355,10 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
                 turn_id: state.current.turns.at(-1)?.id ?? null,
                 role: 'user',
                 content,
+                display_content: pending && (
+                  pending.attachments.length || pending.providerPrompt !== pending.displayContent
+                ) ? pending.displayContent : null,
+                attachments: pending?.attachments ?? [],
                 created_at: clock.nowSeconds(),
                 streaming: false,
               },
@@ -319,7 +368,13 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       } else if (event.event.kind === 'steerRejected') {
         const pending = pendingSteers.current.get(session.id)?.shift();
         if (pending) {
-          state.current = queueSubmission(state.current, pending, clock);
+          state.current = queueSubmission(
+            state.current,
+            pending.displayContent,
+            clock,
+            pending.attachments,
+            pending.providerPrompt,
+          );
           void persistOrdered(state.current).catch(() => {});
           setErrors((values) => ({
             ...values,
@@ -455,6 +510,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const sendPrompt = useCallback(async (
     inputSession: AgentSession,
     rawPrompt: string,
+    attachments: MessageAttachment[] = [],
+    providerPromptOverride?: string,
   ): Promise<AgentSession> => {
     const client = daemon.client;
     const profileId = daemon.activeProfile?.id;
@@ -462,13 +519,16 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       throw new Error('Waku daemon is disconnected');
     }
     const prompt = rawPrompt.trim();
-    if (!prompt) return inputSession;
+    if (!prompt && attachments.length === 0) return inputSession;
+    const providerPrompt = providerPromptOverride === undefined
+      ? providerPromptForSubmission(prompt, attachments)
+      : providerPromptOverride.trim();
     // The screen can hand over a task-list skeleton while hydration is
     // still in flight; building the turn on that would persist a transcript
     // with only the new messages. Always start from the full session.
     let current = await loadFullSession(inputSession.id);
     if (sessionBusy(current)) {
-      const queued = queueSubmission(current, prompt, clock);
+      const queued = queueSubmission(current, prompt, clock, attachments, providerPrompt);
       cacheSession(queued);
       return persistOrdered(queued);
     }
@@ -481,7 +541,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       const project = state.projects.find((item) => item.id === current.project_id);
       if (!project) throw new Error('This task’s project is no longer available on the daemon');
       if (current.workspace?.kind === 'newWorktree') {
-        current = await materializeWorktree(client, current, project.path, prompt);
+        current = await materializeWorktree(
+          client,
+          current,
+          project.path,
+          prompt || attachments[0]?.name || 'task',
+        );
         cacheSession(current);
         current = await persistOrdered(current);
       }
@@ -502,7 +567,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       startup = { binary: probe.path, cwd: sessionCwd(current, project) };
     }
 
-    current = beginTurn(current, prompt, clock);
+    current = beginTurn(current, prompt, clock, attachments, providerPrompt);
     // The ids beginTurn gave the turn and its user message ride along with
     // the prompt, so every other client attached to the runtime mirrors the
     // same rows instead of minting its own.
@@ -537,7 +602,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         setRuntimes((values) => ({ ...values, [current.id]: publicRuntime(runtime!) }));
       }
       await client.request(
-        { type: 'prompt', prompt, turnId: submitted.turnId, messageId: submitted.messageId },
+        {
+          type: 'prompt',
+          prompt: providerPrompt,
+          turnId: submitted.turnId,
+          messageId: submitted.messageId,
+        },
         current.id,
         runtime.runtimeId,
       );
@@ -568,23 +638,31 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
 
   /** Inject a prompt into the running turn when the provider supports it;
    * otherwise fall through to sendPrompt, which queues while busy. */
-  const steerPrompt = useCallback(async (session: AgentSession, rawPrompt: string) => {
+  const steerPrompt = useCallback(async (
+    session: AgentSession,
+    rawPrompt: string,
+    attachments: MessageAttachment[] = [],
+    providerPromptOverride?: string,
+  ) => {
     const client = daemon.client;
     const prompt = rawPrompt.trim();
-    if (!prompt) return;
+    if (!prompt && attachments.length === 0) return;
+    const providerPrompt = providerPromptOverride === undefined
+      ? providerPromptForSubmission(prompt, attachments)
+      : providerPromptOverride.trim();
     if (!client || daemon.phase !== 'connected') throw new Error('Waku daemon is disconnected');
     const runtime = entries.current.get(session.id);
     if (
       !runtime || !runtime.supportsSteer ||
       session.status === 'connecting' || session.status === 'idle' || session.status === 'failed'
     ) {
-      await sendPrompt(session, prompt);
+      await sendPrompt(session, prompt, attachments, providerPrompt);
       return;
     }
     const pending = pendingSteers.current.get(session.id) ?? [];
-    pending.push(prompt);
+    pending.push({ providerPrompt, displayContent: prompt, attachments });
     pendingSteers.current.set(session.id, pending);
-    await client.request({ type: 'steer', prompt }, session.id, runtime.runtimeId);
+    await client.request({ type: 'steer', prompt: providerPrompt }, session.id, runtime.runtimeId);
   }, [daemon.client, daemon.phase, sendPrompt]);
 
   const createTask = useCallback(async (
@@ -658,7 +736,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     markWorking(sessionId);
   }, [daemon.client, markWorking]);
 
-  /** Change model / effort / access mode. Applied live via
+  /** Change model traits / access mode. Applied live via
    * applyOptions when a runtime exists; a runtime that can't take the change
    * is closed so the next prompt restarts with the new options. */
   const updateSessionOptions = useCallback(async (
@@ -756,6 +834,52 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     setErrors((values) => removeKey(values, sessionId));
   }, []);
 
+  // A request in flight when the socket drops rejects with a transport error.
+  // The connection banner owns that outage; once the link is live again the
+  // task must not keep displaying the old rejection indefinitely.
+  useEffect(() => {
+    if (!hasRecoveredDisconnectError) return;
+    setErrors(clearDaemonDisconnectErrors);
+  }, [hasRecoveredDisconnectError]);
+
+  // After a reconnect the daemon replays whatever each followed runtime
+  // emitted while the link was down, so streams resume by themselves. What
+  // it cannot replay is a runtime that no longer exists (the daemon
+  // restarted) or one another client replaced: confirm each entry's runtime
+  // and either drop it, so the next prompt starts fresh, or follow the new
+  // one, whose events are already buffered on the client.
+  useEffect(() => {
+    const client = daemon.client;
+    const profileId = daemon.activeProfile?.id;
+    if (!client || !profileId || daemon.phase !== 'connected') return;
+    if (daemon.connections <= 1 || revalidatedConnections.current === daemon.connections) return;
+    revalidatedConnections.current = daemon.connections;
+    for (const [sessionId, entry] of entries.current) {
+      void attachDaemonSession(client, sessionId).then((attached) => {
+        if (entries.current.get(sessionId) !== entry) return;
+        if (attached?.runtimeId === entry.runtimeId) return;
+        removeRuntime(sessionId);
+        if (attached) {
+          const current = queryClient.getQueryData<AgentSession>(
+            daemonKeys.session(profileId, sessionId),
+          );
+          if (current) subscribe(current, attached.runtimeId, attached.supportsSteer, false);
+        }
+        void queryClient.invalidateQueries({
+          queryKey: daemonKeys.session(profileId, sessionId),
+        });
+      }).catch(() => {});
+    }
+  }, [
+    daemon.activeProfile?.id,
+    daemon.client,
+    daemon.connections,
+    daemon.phase,
+    queryClient,
+    removeRuntime,
+    subscribe,
+  ]);
+
   // Another client (the desktop, the web app) persisting a session announces
   // itself through taskStateChanged. Refetch any hydrated session we are not
   // already following live, so watching a desktop-driven task stays current.
@@ -779,6 +903,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     setPermissions({});
     setUserInputs({});
     setErrors({});
+    revalidatedConnections.current = 0;
     return () => {
       for (const entry of entries.current.values()) entry.unsubscribe();
       entries.current.clear();
@@ -826,6 +951,7 @@ function publicRuntime(entry: RuntimeEntry): MobileRuntime {
     runtimeId: entry.runtimeId,
     supportsSteer: entry.supportsSteer,
     starting: entry.starting,
+    running: entry.running,
   };
 }
 
